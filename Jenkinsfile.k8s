@@ -1,0 +1,210 @@
+pipeline {
+    agent any
+
+    environment {
+        IMAGE = 'blueshift:k8s-${BUILD_NUMBER}'
+        KUBECONFIG_FILE = '/var/lib/jenkins/.kube/config'
+        DEPLOYMENT_BLUE = 'blueshift-blue'
+        DEPLOYMENT_GREEN = 'blueshift-green'
+        SERVICE = 'blueshift-service'
+    }
+
+    stages {
+
+        stage('Checkout') {
+            steps {
+                checkout scm
+            }
+        }
+
+        stage('Build Docker Image') {
+            steps {
+                sh '''
+                    echo "Building BlueShift Docker image..."
+                    docker build -t ${IMAGE} .
+
+                    echo "Image created:"
+                    docker images ${IMAGE}
+                '''
+            }
+        }
+
+        stage('Load Image into Minikube') {
+            steps {
+                sh '''
+                    echo "Loading ${IMAGE} into Minikube..."
+
+                    docker save ${IMAGE} | \
+                    docker exec -i minikube ctr -n k8s.io images import -
+
+                    echo "Verifying image inside Minikube..."
+                    docker exec minikube crictl images | grep "blueshift"
+                '''
+            }
+        }
+
+        stage('Detect Active Color') {
+            steps {
+                script {
+
+                    def activeColor = sh(
+                        script: """
+                            kubectl --kubeconfig=${KUBECONFIG_FILE} \
+                            get service ${SERVICE} \
+                            -o jsonpath='{.spec.selector.color}'
+                        """,
+                        returnStdout: true
+                    ).trim()
+
+                    if (activeColor == 'blue') {
+
+                        env.ACTIVE_COLOR = 'blue'
+                        env.TARGET_COLOR = 'green'
+                        env.TARGET_DEPLOYMENT = env.DEPLOYMENT_GREEN
+
+                    } else if (activeColor == 'green') {
+
+                        env.ACTIVE_COLOR = 'green'
+                        env.TARGET_COLOR = 'blue'
+                        env.TARGET_DEPLOYMENT = env.DEPLOYMENT_BLUE
+
+                    } else {
+
+                        error("Unknown active color: ${activeColor}")
+                    }
+
+                    echo "================================="
+                    echo "Active color : ${env.ACTIVE_COLOR}"
+                    echo "Target color : ${env.TARGET_COLOR}"
+                    echo "Target deployment : ${env.TARGET_DEPLOYMENT}"
+                    echo "================================="
+                }
+            }
+        }
+
+        stage('Deploy Inactive Color') {
+            steps {
+                sh '''
+                    echo "Deploying new version to ${TARGET_COLOR}..."
+
+                    kubectl --kubeconfig=${KUBECONFIG_FILE} \
+                    set image deployment/${TARGET_DEPLOYMENT} \
+                    blueshift=${IMAGE}
+
+                    kubectl --kubeconfig=${KUBECONFIG_FILE} \
+                    set image deployment/${TARGET_DEPLOYMENT} \
+                    blueshift=${IMAGE}
+
+                    kubectl --kubeconfig=${KUBECONFIG_FILE} \
+                    rollout status deployment/${TARGET_DEPLOYMENT} \
+                    --timeout=120s
+                '''
+            }
+        }
+
+        stage('Health Check') {
+            steps {
+                sh '''
+                    echo "Performing health check on ${TARGET_COLOR}..."
+
+                    POD=$(kubectl --kubeconfig=${KUBECONFIG_FILE} \
+                    get pods \
+                    -l app=blueshift,color=${TARGET_COLOR} \
+                    -o jsonpath='{.items[0].metadata.name}')
+
+                    echo "Target pod: ${POD}"
+
+                    kubectl --kubeconfig=${KUBECONFIG_FILE} \
+                    exec ${POD} -- \
+                    wget -q -O - http://127.0.0.1:80
+
+                    echo ""
+                    echo "Health check PASSED for ${TARGET_COLOR}!"
+                '''
+            }
+        }
+
+        stage('Switch Traffic') {
+            steps {
+                sh '''
+                    echo "Switching traffic:"
+                    echo "${ACTIVE_COLOR} -> ${TARGET_COLOR}"
+
+                    kubectl --kubeconfig=${KUBECONFIG_FILE} \
+                    patch service ${SERVICE} \
+                    -p "{\"spec\":{\"selector\":{\"app\":\"blueshift\",\"color\":\"${TARGET_COLOR}\"}}}"
+
+                    echo "Traffic switched to ${TARGET_COLOR}."
+
+                    echo "Service selector:"
+                    kubectl --kubeconfig=${KUBECONFIG_FILE} \
+                    get service ${SERVICE} \
+                    -o jsonpath='{.spec.selector}'
+                    
+                    echo ""
+                '''
+
+                script {
+                    env.TRAFFIC_SWITCHED = 'true'
+                }
+            }
+        }
+
+        stage('Verify Traffic') {
+            steps {
+                sh '''
+                    echo "Verifying Kubernetes Service..."
+
+                    kubectl --kubeconfig=${KUBECONFIG_FILE} \
+                    get endpoints ${SERVICE}
+
+                    kubectl --kubeconfig=${KUBECONFIG_FILE} \
+                    run blueshift-verify \
+                    --rm \
+                    -i \
+                    --restart=Never \
+                    --image=curlimages/curl \
+                    -- curl -fsS http://${SERVICE}
+
+                    echo ""
+                    echo "================================="
+                    echo "BlueShift deployment SUCCESSFUL!"
+                    echo "Active color: ${TARGET_COLOR}"
+                    echo "================================="
+                '''
+            }
+        }
+    }
+
+    post {
+
+        success {
+            echo 'BlueShift Kubernetes blue-green deployment completed successfully!'
+        }
+
+        failure {
+            echo 'BlueShift Kubernetes deployment failed.'
+
+            script {
+
+                if (env.TRAFFIC_SWITCHED == 'true') {
+
+                    echo "Attempting automatic rollback to ${env.ACTIVE_COLOR}..."
+
+                    sh """
+                        kubectl --kubeconfig=${KUBECONFIG_FILE} \
+                        patch service ${SERVICE} \
+                        -p '{"spec":{"selector":{"app":"blueshift","color":"${env.ACTIVE_COLOR}"}}}'
+
+                        echo "Rollback completed."
+                    """
+
+                } else {
+
+                    echo "Traffic was not switched."
+                    echo "Existing active version remains available."
+                }
+            }
+        }
+    }
+}
