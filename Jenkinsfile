@@ -20,7 +20,7 @@ pipeline {
                 sh '''
                     docker stop blueshift-container || true
                     docker rm blueshift-container || true
-                    docker run -d --name blueshift-container -p 8080:80 blueshift:latest
+                    docker run -d --name blueshift-container -p 8081:80 blueshift:latest
                 '''
             }
         }
